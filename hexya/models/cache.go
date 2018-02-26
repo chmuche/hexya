@@ -30,8 +30,20 @@ type cacheRef struct {
 // A cache holds records field values for caching the database to
 // improve performance. cache is not safe for concurrent access.
 type cache struct {
-	data     map[cacheRef]FieldMap
-	m2mLinks map[*Model]map[[2]int64]bool
+	counterID       int64
+	data            map[cacheRef]*FieldMap
+	m2mLinks        map[*Model]map[[2]int64]bool
+	scheduledInsert map[cacheRef]cacheRef
+	scheduledUpdate map[cacheRef]map[string]bool
+}
+
+func (c *cache) isInDb(ref cacheRef) bool {
+	return !c.isNotInDb(ref)
+}
+
+func (c *cache) isNotInDb(ref cacheRef) bool {
+	insertedRef := c.scheduledInsert[ref]
+	return ref.id <= 0 && insertedRef.id <= 0
 }
 
 // updateEntry creates or updates an entry in the cache defined by its model, id and fieldName.
@@ -45,12 +57,43 @@ func (c *cache) updateEntry(mi *Model, id int64, fieldName string, value interfa
 	return nil
 }
 
+func (c *cache) filterIdInCache(rc *RecordCollection) (*RecordCollection, *RecordCollection) {
+	var idsInCache, idsNotInCache []int64
+	for _, id := range rc.ids {
+		if _, found := c.data[c.getCacheRef(rc.model, id)]; found {
+			idsInCache = append(idsInCache, c.getCacheRef(rc.model, id).id)
+		} else {
+			idsNotInCache = append(idsNotInCache, c.getCacheRef(rc.model, id).id)
+		}
+	}
+	return rc.env.Pool(rc.ModelName()).withIds(idsInCache), rc.env.Pool(rc.ModelName()).withIds(idsNotInCache)
+}
+
+//Get the data by the ref and init it if not exist
+func (c *cache) getData(ref cacheRef) FieldMap {
+	if _, ok := c.data[ref]; !ok {
+		v := make(FieldMap)
+		c.data[ref] = &v
+		(*c.data[ref])["id"] = ref.id
+	}
+	return *c.data[ref]
+}
+
+func (c *cache) initWithData(ref cacheRef, data FieldMap) FieldMap {
+	c.data[ref] = &data
+	(*c.data[ref])["id"] = ref.id
+	return *c.data[ref]
+}
+
 // updateEntryByRef creates or updates an entry to the cache from a cacheRef
 // and a field json name (no path).
 func (c *cache) updateEntryByRef(ref cacheRef, jsonName string, value interface{}) {
-	if _, ok := c.data[ref]; !ok {
-		c.data[ref] = make(FieldMap)
-		c.data[ref]["id"] = ref.id
+	c.getData(ref)
+	if ref.id > 0 {
+		if _, ok := c.scheduledUpdate[ref]; !ok {
+			c.scheduledUpdate[ref] = make(map[string]bool)
+		}
+		c.scheduledUpdate[ref][jsonName] = true
 	}
 	fi := ref.model.fields.MustGet(jsonName)
 	switch fi.fieldType {
@@ -59,18 +102,18 @@ func (c *cache) updateEntryByRef(ref cacheRef, jsonName string, value interface{
 		for _, id := range ids {
 			c.updateEntry(fi.relatedModel, id, fi.jsonReverseFK, ref.id)
 		}
-		c.data[ref][jsonName] = true
+		c.getData(ref)[jsonName] = true
 	case fieldtype.Rev2One:
 		id := value.(int64)
 		c.updateEntry(fi.relatedModel, id, fi.jsonReverseFK, ref.id)
-		c.data[ref][jsonName] = true
+		c.getData(ref)[jsonName] = true
 	case fieldtype.Many2Many:
 		ids := value.([]int64)
 		c.removeM2MLinks(fi, ref.id)
 		c.addM2MLink(fi, ref.id, ids)
-		c.data[ref][jsonName] = true
+		c.getData(ref)[jsonName] = true
 	default:
-		c.data[ref][jsonName] = value
+		c.getData(ref)[jsonName] = value
 	}
 }
 
@@ -147,7 +190,7 @@ func (c *cache) addRecord(mi *Model, id int64, fMap FieldMap) {
 // this method, since this will bring discrepancies in the other
 // records references (One2Many and Many2Many fields).
 func (c *cache) invalidateRecord(mi *Model, id int64) {
-	delete(c.data, cacheRef{model: mi, id: id})
+	delete(c.data, c.getCacheRef(mi, id))
 	for _, fi := range mi.fields.registryByJSON {
 		if fi.fieldType == fieldtype.Many2Many {
 			c.removeM2MLinks(fi, id)
@@ -160,7 +203,7 @@ func (c *cache) removeEntry(mi *Model, id int64, fieldName string) {
 	if !c.checkIfInCache(mi, []int64{id}, []string{fieldName}) {
 		return
 	}
-	delete(c.data[cacheRef{model: mi, id: id}], fieldName)
+	delete(c.getData(c.getCacheRef(mi, id)), fieldName)
 	fi := mi.fields.MustGet(fieldName)
 	if fi.fieldType == fieldtype.Many2Many {
 		c.removeM2MLinks(fi, id)
@@ -185,7 +228,7 @@ func (c *cache) get(mi *Model, id int64, fieldName string) interface{} {
 			if cRef.model != fi.relatedModel {
 				continue
 			}
-			if cVal[fi.jsonReverseFK] != ref.id {
+			if (*cVal)[fi.jsonReverseFK] != ref.id {
 				continue
 			}
 			relIds = append(relIds, cRef.id)
@@ -196,7 +239,7 @@ func (c *cache) get(mi *Model, id int64, fieldName string) interface{} {
 			if cRef.model != fi.relatedModel {
 				continue
 			}
-			if cVal[fi.jsonReverseFK] != ref.id {
+			if (*cVal)[fi.jsonReverseFK] != ref.id {
 				continue
 			}
 			return cRef.id
@@ -205,7 +248,7 @@ func (c *cache) get(mi *Model, id int64, fieldName string) interface{} {
 	case fieldtype.Many2Many:
 		return c.getM2MLinks(fi, ref.id)
 	default:
-		return c.data[ref][fName]
+		return c.getData(ref)[fName]
 	}
 }
 
@@ -213,8 +256,8 @@ func (c *cache) get(mi *Model, id int64, fieldName string) interface{} {
 // as it is currently in cache.
 func (c *cache) getRecord(model *Model, id int64) FieldMap {
 	res := make(FieldMap)
-	ref := cacheRef{model: model, id: id}
-	for _, fName := range c.data[ref].Keys() {
+	ref := model.toRef(id)
+	for _, fName := range c.getData(ref).Keys() {
 		res[fName] = c.get(model, id, fName)
 	}
 	return res
@@ -224,17 +267,24 @@ func (c *cache) getRecord(model *Model, id int64) FieldMap {
 // in cache for all the records with the given ids in the given model.
 func (c *cache) checkIfInCache(mi *Model, ids []int64, fieldNames []string) bool {
 	for _, id := range ids {
+		if id < 0 {
+			continue
+		}
 		for _, fName := range fieldNames {
 			ref, path, err := c.getRelatedRef(mi, id, fName)
 			if err != nil {
 				return false
 			}
-			if _, ok := c.data[ref][path]; !ok {
+			if _, ok := c.getData(ref)[path]; !ok {
 				return false
 			}
 		}
 	}
 	return true
+}
+
+func (c *cache) copyPointer(from cacheRef, to cacheRef) {
+	c.data[to] = c.data[from]
 }
 
 // getRelatedRef returns the cacheRef and field name of the field that is
@@ -249,14 +299,20 @@ func (c *cache) getRelatedRef(mi *Model, id int64, path string) (cacheRef, strin
 		}
 		return c.getRelatedRef(relMI, fkID, strings.Join(exprs[1:], ExprSep))
 	}
-	return cacheRef{model: mi, id: id}, exprs[0], nil
+	return mi.toRef(id), exprs[0], nil
+}
+
+func (c *cache) getCacheRef(mi *Model, id int64) cacheRef {
+	return cacheRef{model: mi, id: id}
 }
 
 // newCache creates a pointer to a new cache instance.
 func newCache() *cache {
 	res := cache{
-		data:     make(map[cacheRef]FieldMap),
-		m2mLinks: make(map[*Model]map[[2]int64]bool),
+		data:            make(map[cacheRef]*FieldMap),
+		m2mLinks:        make(map[*Model]map[[2]int64]bool),
+		scheduledInsert: make(map[cacheRef]cacheRef),
+		scheduledUpdate: make(map[cacheRef]map[string]bool),
 	}
 	return &res
 }

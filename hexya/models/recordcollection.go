@@ -87,9 +87,8 @@ func (rc *RecordCollection) create(data FieldMapper) *RecordCollection {
 	fMap.RemovePKIfZero()
 	storedFieldMap := filterMapOnStoredFields(rc.model, fMap)
 	// insert in DB
-	var createdId int64
-	sql, args := rc.query.insertQuery(storedFieldMap)
-	rc.env.cr.Get(&createdId, sql, args...)
+	var createdId int64 = rc.createInCache(storedFieldMap)
+
 
 	rSet := rc.withIds([]int64{createdId})
 	// update reverse relation fields
@@ -244,17 +243,18 @@ func (rc *RecordCollection) doUpdate(fMap FieldMap) {
 		}
 	}()
 	fMap = filterMapOnAuthorizedFields(rc.model, fMap, rc.env.uid, security.Write)
-	// update DB
-	if len(fMap) > 0 {
-		sql, args := rc.query.updateQuery(fMap)
-		res := rc.env.cr.Execute(sql, args...)
+	var rcInCache, rcNotInCache = rc.env.cache.filterIdInCache(rc)
+	// update DB only the record not in cache
+	if len(fMap) > 0 && rcNotInCache.Len() > 0 {
+		sql, args := rcNotInCache.query.updateQuery(fMap)
+		res := rcNotInCache.env.cr.Execute(sql, args...)
 		if num, _ := res.RowsAffected(); num == 0 {
-			log.Panic("Trying to update an empty RecordSet", "model", rc.ModelName(), "values", fMap)
+			log.Panic("Trying to update an empty RecordSet", "model", rcNotInCache.ModelName(), "values", fMap)
 		}
 	}
-	for _, rec := range rc.Records() {
+	for _, rec := range rcInCache.Records() {
 		for k, v := range fMap {
-			rc.env.cache.updateEntry(rc.model, rec.Ids()[0], k, v)
+			rcInCache.env.cache.updateEntry(rcInCache.model, rec.Ids()[0], k, v)
 		}
 	}
 }
@@ -275,6 +275,10 @@ func (rc *RecordCollection) updateRelationFields(fMap FieldMap) {
 			if rc.Len() > 1 {
 				log.Warn("Updating one2many relation on multiple record at once", "model", rc.ModelName(), "field", field)
 			}
+			if len(rc.ids) == 0 {
+				log.Panic("What are you trying to do", rc.ModelName(), field, fi.relatedModelName, fi.name)
+			}
+			fmt.Println("IDS = ", rc.ids)
 			curRS := rc.env.Pool(fi.relatedModelName).Search(fi.relatedModel.Field("ID").In(rc.Get(fi.name).(RecordSet).Collection()))
 			newRS := rc.env.Pool(fi.relatedModelName).Search(fi.relatedModel.Field("ID").In(value.([]int64)))
 			// Remove ReverseFK for Records that are no longer our children
@@ -610,6 +614,9 @@ func (rc *RecordCollection) get(field string, all bool) (interface{}, bool) {
 			rc.Load()
 		}
 		dbCalled = true
+	}
+	if len(rc.ids) == 0 {
+		log.Panic("What are you trying to do", rc.ModelName(), field)
 	}
 	return rc.env.cache.get(rc.model, rc.ids[0], field), dbCalled
 }

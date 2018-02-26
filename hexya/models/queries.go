@@ -221,16 +221,19 @@ func (q *Query) insertQuery(data FieldMap) (string, SQLParams) {
 		i    int
 		sql  string
 	)
-	for k, v := range data {
-		fi := q.recordSet.model.fields.MustGet(k)
+	for field, value := range data {
+		fi := q.recordSet.model.fields.MustGet(field)
 		if fi.fieldType.IsFKRelationType() && !fi.required {
-			if _, ok := v.(*interface{}); ok {
+			if _, ok := value.(*interface{}); ok {
 				// We have a null fk field
 				continue
 			}
 		}
+		if field == "id" {
+			continue
+		}
 		cols = append(cols, fi.json)
-		vals = append(vals, v)
+		vals = append(vals, value)
 		i++
 	}
 	tableName := adapter.quoteTableName(q.recordSet.model.tableName)

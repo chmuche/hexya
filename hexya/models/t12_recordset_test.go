@@ -35,7 +35,7 @@ func TestCreateRecordSet(t *testing.T) {
 				}
 				users := env.Pool("User").Call("Create", userJohnData).(RecordSet).Collection()
 				So(users.Len(), ShouldEqual, 1)
-				So(users.Get("ID"), ShouldBeGreaterThan, 0)
+				So(users.Get("ID"), ShouldBeLessThan, 0)
 			})
 			Convey("Creating user Jane with related Profile and Posts and Tags", func() {
 				userJaneProfileData := FieldMap{
@@ -72,6 +72,8 @@ func TestCreateRecordSet(t *testing.T) {
 				userJane := env.Pool("User").Call("Create", userJaneData).(RecordSet).Collection()
 				So(userJane.Len(), ShouldEqual, 1)
 				So(userJane.Get("Profile").(RecordSet).Collection().Get("ID"), ShouldEqual, profile.Get("ID"))
+				res, _ := post1.get("User", false)
+				So(res, ShouldEqual, userJane.Get("ID"))
 				So(post1.Get("User").(RecordSet).Collection().Get("ID"), ShouldEqual, userJane.Get("ID"))
 				So(post2.Get("User").(RecordSet).Collection().Get("ID"), ShouldEqual, userJane.Get("ID"))
 				janePosts := userJane.Get("Posts").(RecordSet).Collection()
@@ -106,7 +108,7 @@ func TestCreateRecordSet(t *testing.T) {
 				}
 				userWill := env.Pool("User").Call("Create", userWillData).(RecordSet).Collection()
 				So(userWill.Len(), ShouldEqual, 1)
-				So(userWill.Get("ID"), ShouldBeGreaterThan, 0)
+				So(userWill.Get("ID"), ShouldBeLessThan, 0)
 			})
 			Convey("Checking constraint methods enforcement", func() {
 				tag1Data := FieldMap{
